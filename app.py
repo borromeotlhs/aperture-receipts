@@ -1,17 +1,14 @@
 import os
+import json
 from flask import Flask, redirect, request, url_for, session
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
-
-# IMPORTANT:
-# Set this in Railway as a long random value (e.g., 32+ chars)
-# Railway variable name I'd use: FLASK_SECRET_KEY
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", os.environ.get("FLASK_SECRET", "dev"))
-
-# Ensure Flask knows the real scheme/host behind Railway's proxy
+app.secret_key = os.environ.get("FLASK_SECRET", "dev")
 app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 SCOPES = [
@@ -19,8 +16,10 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
 ]
 
+TOKEN_PATH = os.environ.get("TOKEN_PATH", "token.json")
+
+
 def client_config():
-    # Put your OAuth "Web application" client_id/secret into Railway env vars
     return {
         "web": {
             "client_id": os.environ["GOOGLE_CLIENT_ID"],
@@ -30,72 +29,88 @@ def client_config():
         }
     }
 
-def redirect_uri():
-    """
-    Use an explicit env var if provided, otherwise derive from the request host.
-    IMPORTANT: This must EXACTLY match what you entered in Google Cloud Console
-    under Authorized redirect URIs.
-    """
-    return os.environ.get("GOOGLE_REDIRECT_URI") or url_for("oauth2callback", _external=True)
+
+def save_creds(creds: Credentials) -> None:
+    os.makedirs(os.path.dirname(TOKEN_PATH) or ".", exist_ok=True)
+    with open(TOKEN_PATH, "w", encoding="utf-8") as f:
+        f.write(creds.to_json())
+
+
+def load_creds() -> Credentials | None:
+    if not os.path.exists(TOKEN_PATH):
+        return None
+    with open(TOKEN_PATH, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return Credentials.from_authorized_user_info(data, scopes=SCOPES)
+
+
+def get_creds() -> Credentials | None:
+    creds = load_creds()
+    if not creds:
+        return None
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        save_creds(creds)
+    return creds
+
 
 @app.get("/")
 def home():
-    return "Aperture Receipts: OK. Go to /auth to connect Google."
+    creds = get_creds()
+    if creds:
+        return "Aperture Receipts: authorized ✅ (token stored). Next: /files"
+    return "Aperture Receipts: not authorized yet. Go to /auth"
+
 
 @app.get("/auth")
 def auth():
-    # Clear any stale session state from previous attempts
-    session.pop("state", None)
-    session.pop("code_verifier", None)
-
     flow = Flow.from_client_config(
         client_config(),
         scopes=SCOPES,
-        redirect_uri=redirect_uri(),
+        redirect_uri=url_for("oauth2callback", _external=True),
     )
-
     auth_url, state = flow.authorization_url(
         access_type="offline",
         include_granted_scopes="true",
         prompt="consent",
     )
-
-    # Persist state + PKCE verifier so callback can fetch token without "Missing code verifier"
-    session["state"] = state
-    session["code_verifier"] = getattr(flow, "code_verifier", None)
-
+    session["oauth_state"] = state
     return redirect(auth_url)
+
 
 @app.get("/oauth2callback")
 def oauth2callback():
-    # Recreate flow with same redirect + state
     flow = Flow.from_client_config(
         client_config(),
         scopes=SCOPES,
-        state=session.get("state"),
-        redirect_uri=redirect_uri(),
+        redirect_uri=url_for("oauth2callback", _external=True),
+        state=session.get("oauth_state"),
     )
-
-    # Restore PKCE verifier (if this library version uses it)
-    cv = session.get("code_verifier")
-    if cv:
-        setattr(flow, "code_verifier", cv)
-
-    # Exchange code for tokens
     flow.fetch_token(authorization_response=request.url)
     creds = flow.credentials
+    save_creds(creds)
 
-    # For now we just prove Drive access by listing a few files
+    # quick proof it works
     service = build("drive", "v3", credentials=creds)
-    results = service.files().list(pageSize=5, fields="files(id,name)").execute()
+    results = service.files().list(pageSize=3, fields="files(id,name)").execute()
     items = results.get("files", [])
 
     return {
         "status": "authorized",
-        "authed_as_hint": "This lists files for the Google account you used during consent.",
+        "token_saved_to": TOKEN_PATH,
         "sample_files": items,
-        "note": "Next step: store refresh token securely + process receipts folder + write to Spent sheet."
+        "next": "Go to / to confirm it stays authorized after redeploy.",
     }
+
+
+# Placeholder for next steps (B)
+@app.get("/files")
+def files():
+    creds = get_creds()
+    if not creds:
+        return {"error": "Not authorized. Visit /auth first."}, 401
+    return {"ok": True, "note": "B will list files in your receipts folder."}
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")), debug=True)
