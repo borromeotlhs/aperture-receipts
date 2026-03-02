@@ -3,9 +3,11 @@ import json
 from flask import Flask, redirect, request, url_for
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET", "dev")
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
 SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
